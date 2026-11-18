@@ -49,6 +49,30 @@
         },
         "default": 0,
         "description": "Subtract (or add) a set amount from the temperature reading (use negative numbers to subtract). This setting only applies to fans."
+      },
+      "commandIntervalMs": {
+        "title": "Command Interval (ms)",
+        "type": "number",
+        "default": 600,
+        "minimum": 0,
+        "maximum": 5000,
+        "description": "Minimum time between two commands to the same device, so scenes aren't dropped. 0 turns pacing off."
+      },
+      "commandCoalesceMs": {
+        "title": "Command Merge Window (ms)",
+        "type": "number",
+        "default": 100,
+        "minimum": 0,
+        "maximum": 1000,
+        "description": "Writes to the same device within this window are sent as one command. Never more than the command interval."
+      },
+      "commandConfirmTimeoutMs": {
+        "title": "Command Confirm Timeout (ms)",
+        "type": "number",
+        "default": 3000,
+        "minimum": 0,
+        "maximum": 15000,
+        "description": "Resend a command once if the device hasn't confirmed it within this time. 0 turns resending off."
       }
     }
   },
@@ -67,6 +91,16 @@
       "items": [
         "hideTemperatureSensor",
         "temperatureOffset"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Command Pacing",
+      "expandable": true,
+      "items": [
+        "commandIntervalMs",
+        "commandCoalesceMs",
+        "commandConfirmTimeoutMs"
       ]
     }
   ]

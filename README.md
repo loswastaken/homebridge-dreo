@@ -63,6 +63,21 @@ Please open an issue if you have another model that works or doesn't work. If yo
 
 Devices that Dreo reports as offline (unplugged, or disconnected from WiFi) show as **No Response** in HomeKit, and recover automatically when they reconnect. If Homebridge loses its connection to the Dreo cloud for more than 30 seconds, all Dreo devices show as No Response until the connection is restored, since they can't be controlled in the meantime. Device state is refreshed after every reconnect.
 
+### Command pacing
+
+Dreo devices silently ignore commands that arrive too close together, which is what a HomeKit scene or automation produces when it sets several things at once (for example power, speed and oscillation). HomeKit then shows the new state even though the device never changed. To avoid this, commands are queued per device:
+
+* Writes to the same device within `commandCoalesceMs` (default 100 ms) are merged into one command. A write that only updates values still waiting to be sent (for example dragging the speed slider) is merged too. Fan light settings (`lighton`, `brightness`, `colortemp`) are sent separately from the fan's own settings.
+* Commands to the same device are spaced at least `commandIntervalMs` apart (default 600 ms). Different devices never wait on each other. Set `commandIntervalMs` to `0` to turn the queue off and send every write immediately, as older versions did.
+
+All of these options are optional; leave them out to use the defaults. An invalid value is replaced by the default with a warning in the log.
+
+| Option | Default | Range | Description |
+| --- | --- | --- | --- |
+| `commandIntervalMs` | 600 | 0 - 5000 | Minimum time between two commands to the same device. 0 turns pacing off. |
+| `commandCoalesceMs` | 100 | 0 - 1000 | Merge window for writes to the same device. Never more than `commandIntervalMs`. |
+| `commandConfirmTimeoutMs` | 3000 | 0 - 15000 | Reserved for confirming commands. |
+
 ### Fans
 
 * **Fan Speed:** Fan speed is displayed as a percentage value with steps that are equivalent to those of the Dreo app. (for example, a fan with speeds 1-6 will have steps at 17%, 33%, 50% etc)
@@ -127,6 +142,9 @@ Provide your Dreo app login credentials
     },
     "hideTemperatureSensor": false,
     "temperatureOffset": 0,
+    "commandIntervalMs": 600,
+    "commandCoalesceMs": 100,
+    "commandConfirmTimeoutMs": 3000,
     "name": "Dreo Platform",
     "platform": "DreoPlatform"
   }

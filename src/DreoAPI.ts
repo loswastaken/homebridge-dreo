@@ -1,6 +1,7 @@
 import axios from 'axios';
 import MD5 from 'crypto-js/md5';
 import DreoWebSocket from './DreoWebSocket';
+import CommandQueue, { validateCommandQueueOptions } from './CommandQueue';
 import type { DreoPlatform } from './platform';
 import type { Logger } from 'homebridge';
 
@@ -14,6 +15,7 @@ export default class DreoAPI {
   private readonly log: Logger;
   private access_token: string;
   private ws!: DreoWebSocket;
+  private readonly queue: CommandQueue;
   public server: string;
 
   constructor(platform: DreoPlatform) {
@@ -22,6 +24,15 @@ export default class DreoAPI {
     this.password = platform.config.options?.password;
     this.server = 'us';
     this.access_token = '';
+    // Paces control commands so devices don't drop the ones that arrive too close together
+    this.queue = new CommandQueue((sn, params) => {
+      this.ws.send(JSON.stringify({
+        'deviceSn': sn,
+        'method': 'control',
+        'params': params,
+        'timestamp': Date.now(),
+      }));
+    }, this.log, validateCommandQueueOptions(platform.config, this.log));
   }
 
   // Get authentication token
@@ -131,11 +142,13 @@ export default class DreoAPI {
       return 'wss://wsb-'+this.server+'.dreo-tech.com/websocket?accessToken='+this.access_token+'&timestamp='+Date.now();
     }, this.log);
 
+    this.queue.start();
     this.ws.start();
   }
 
   // Close the websocket and stop reconnecting (called on Homebridge shutdown)
   public stopWebSocket() {
+    this.queue.stop();
     this.ws?.stop();
   }
 
@@ -175,13 +188,8 @@ export default class DreoAPI {
     this.injectMessage({devicesn: sn, method: 'device-online', reported: reported});
   }
 
-  // Send control commands to device (fan speed, power, etc)
+  // Send control commands to device (fan speed, power, etc). Commands are queued and paced per device.
   public control(sn, command) {
-    this.ws.send(JSON.stringify({
-      'deviceSn': sn,
-      'method': 'control',
-      'params': command,
-      'timestamp': Date.now(),
-    }));
+    this.queue.enqueue(sn, command);
   }
 }
