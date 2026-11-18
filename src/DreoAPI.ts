@@ -142,6 +142,18 @@ export default class DreoAPI {
       return 'wss://wsb-'+this.server+'.dreo-tech.com/websocket?accessToken='+this.access_token+'&timestamp='+Date.now();
     }, this.log);
 
+    // Device reports confirm that queued commands were applied
+    this.ws.addEventListener('message', (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg && typeof msg.devicesn === 'string') {
+        this.queue.handleMessage(msg);
+      }
+    });
     this.queue.start();
     this.ws.start();
   }

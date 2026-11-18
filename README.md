@@ -69,6 +69,7 @@ Dreo devices silently ignore commands that arrive too close together, which is w
 
 * Writes to the same device within `commandCoalesceMs` (default 100 ms) are merged into one command. A write that only updates values still waiting to be sent (for example dragging the speed slider) is merged too. Fan light settings (`lighton`, `brightness`, `colortemp`) are sent separately from the fan's own settings.
 * Commands to the same device are spaced at least `commandIntervalMs` apart (default 600 ms). Different devices never wait on each other. Set `commandIntervalMs` to `0` to turn the queue off and send every write immediately, as older versions did.
+* If the device doesn't report the change within `commandConfirmTimeoutMs` (default 3000 ms), the command is resent once, unless a newer write to that device was made in the meantime. A device that ignores the resend as well is logged as a warning (at most once every 10 minutes per device). Set `commandConfirmTimeoutMs` to `0` to turn resending off.
 
 All of these options are optional; leave them out to use the defaults. An invalid value is replaced by the default with a warning in the log.
 
@@ -76,7 +77,7 @@ All of these options are optional; leave them out to use the defaults. An invali
 | --- | --- | --- | --- |
 | `commandIntervalMs` | 600 | 0 - 5000 | Minimum time between two commands to the same device. 0 turns pacing off. |
 | `commandCoalesceMs` | 100 | 0 - 1000 | Merge window for writes to the same device. Never more than `commandIntervalMs`. |
-| `commandConfirmTimeoutMs` | 3000 | 0 - 15000 | Reserved for confirming commands. |
+| `commandConfirmTimeoutMs` | 3000 | 0 - 15000 | How long to wait for the device to confirm a command before resending it once. 0 turns resending off. |
 
 ### Fans
 

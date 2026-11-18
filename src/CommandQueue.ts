@@ -19,6 +19,9 @@ const OPTION_LIMITS: Record<keyof CommandQueueOptions, {default: number; min: nu
   commandConfirmTimeoutMs: {default: 3000, min: 0, max: 15000},
 };
 
+// A device that keeps ignoring commands is warned about at most this often
+const WARN_INTERVAL = 10 * 60 * 1000;
+
 // Keys that control a fan's light. A device applies these separately from the fan itself.
 const LIGHT_KEYS = new Set(['lighton', 'brightness', 'colortemp']);
 
@@ -28,6 +31,17 @@ interface Batch {
   params: Params;
   part: Part;
   createdAt: number;
+  // A resend is never merged with other writes and never resent again
+  resend: boolean;
+}
+
+// A sent batch waiting for the device to report the new state
+interface Sent {
+  params: Params;
+  resend: boolean;
+  // Number of writes to the device when this batch was sent; any newer write cancels the resend
+  writes: number;
+  timer: NodeJS.Timeout;
 }
 
 interface DeviceQueue {
@@ -35,6 +49,17 @@ interface DeviceQueue {
   batches: Batch[];
   lastSentAt: number;
   timer?: NodeJS.Timeout;
+  // Number of writes enqueued so far, resends excluded
+  writes: number;
+  awaiting: Sent[];
+  lastWarnAt: number;
+}
+
+// The fields of an incoming Dreo message that confirmation looks at
+export interface DeviceMessage {
+  devicesn: string;
+  method?: unknown;
+  reported?: unknown;
 }
 
 // Read the pacing options from the platform config. Missing values use the default; invalid ones
@@ -84,6 +109,7 @@ export default class CommandQueue {
   private readonly devices = new Map<string, DeviceQueue>();
   private readonly intervalMs: number;
   private readonly coalesceMs: number;
+  private readonly confirmTimeoutMs: number;
   private stopped = false;
 
   constructor(
@@ -93,6 +119,7 @@ export default class CommandQueue {
   ) {
     this.intervalMs = options.commandIntervalMs;
     this.coalesceMs = options.commandCoalesceMs;
+    this.confirmTimeoutMs = options.commandConfirmTimeoutMs;
   }
 
   // Accept commands again after stop()
@@ -101,6 +128,30 @@ export default class CommandQueue {
   }
 
   public enqueue(sn: string, params: Params) {
+    this.add(sn, params, false);
+  }
+
+  // Confirm sent commands from the device's own reports. A 'control-reply' only comes from the cloud
+  // and is sent even when the device ignored the command, so it does not count.
+  public handleMessage(msg: DeviceMessage) {
+    if (msg.method !== 'control-report' && msg.method !== 'report') {
+      return;
+    }
+    const device = this.devices.get(msg.devicesn);
+    if (!device || device.awaiting.length === 0 || !msg.reported || typeof msg.reported !== 'object') {
+      return;
+    }
+    const reported = msg.reported as Params;
+    device.awaiting = device.awaiting.filter((sent) => {
+      if (!Object.keys(sent.params).some((key) => key in reported)) {
+        return true;
+      }
+      clearTimeout(sent.timer);
+      return false;
+    });
+  }
+
+  private add(sn: string, params: Params, resend: boolean) {
     // Queue off: send straight away, exactly as before pacing existed
     if (this.intervalMs === 0) {
       this.send(sn, params);
@@ -112,17 +163,20 @@ export default class CommandQueue {
     }
 
     const device = this.getDevice(sn);
+    if (!resend) {
+      device.writes++;
+    }
     const now = Date.now();
     const keys = Object.keys(params);
     const part = partOf(keys);
     const newest = device.batches[device.batches.length - 1];
 
-    if (newest && part !== 'mixed' && newest.part === part &&
+    if (newest && !resend && !newest.resend && part !== 'mixed' && newest.part === part &&
       (now - newest.createdAt < this.coalesceMs || keys.every((key) => key in newest.params))) {
       Object.assign(newest.params, params);
       this.log.debug('Merged command for %s into pending batch (keys: %s)', sn, Object.keys(newest.params).join(', '));
     } else {
-      device.batches.push({params: {...params}, part: part, createdAt: now});
+      device.batches.push({params: {...params}, part: part, createdAt: now, resend: resend});
     }
     this.schedule(sn, device);
   }
@@ -138,6 +192,8 @@ export default class CommandQueue {
       }
       dropped += device.batches.length;
       device.batches = [];
+      device.awaiting.forEach((sent) => clearTimeout(sent.timer));
+      device.awaiting = [];
     });
     this.log.debug('Command queue stopped, dropped %d queued command(s)', dropped);
   }
@@ -145,7 +201,7 @@ export default class CommandQueue {
   private getDevice(sn: string) {
     let device = this.devices.get(sn);
     if (!device) {
-      device = {batches: [], lastSentAt: -Infinity};
+      device = {batches: [], lastSentAt: -Infinity, writes: 0, awaiting: [], lastWarnAt: -Infinity};
       this.devices.set(sn, device);
     }
     return device;
@@ -188,7 +244,43 @@ export default class CommandQueue {
     } catch (error) {
       this.log.warn('Could not send command to Dreo device %s: %s', sn, (error as Error)?.message ?? error);
     }
+    this.awaitConfirmation(sn, device, batch);
     this.schedule(sn, device);
+  }
+
+  // Resend a batch once if the device doesn't report the change in time
+  private awaitConfirmation(sn: string, device: DeviceQueue, batch: Batch) {
+    if (this.confirmTimeoutMs === 0) {
+      return;
+    }
+    const sent: Sent = {
+      params: batch.params,
+      resend: batch.resend,
+      writes: device.writes,
+      timer: setTimeout(() => {
+        device.awaiting = device.awaiting.filter((other) => other !== sent);
+        this.unconfirmed(sn, device, sent);
+      }, this.confirmTimeoutMs),
+    };
+    device.awaiting.push(sent);
+  }
+
+  private unconfirmed(sn: string, device: DeviceQueue, sent: Sent) {
+    const keys = Object.keys(sent.params).join(', ');
+    if (sent.resend) {
+      const now = Date.now();
+      if (now - device.lastWarnAt >= WARN_INTERVAL) {
+        device.lastWarnAt = now;
+        this.log.warn('Dreo device %s did not confirm %s after a resend', sn, keys);
+      }
+      return;
+    }
+    if (this.stopped || device.writes !== sent.writes) {
+      // Stopped, or a newer write has replaced this one
+      return;
+    }
+    this.log.debug('Dreo device %s did not confirm %s, resending', sn, keys);
+    this.add(sn, sent.params, true);
   }
 }
 
