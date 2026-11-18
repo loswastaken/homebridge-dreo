@@ -355,13 +355,11 @@ export class FanAccessory extends BaseAccessory {
   // Handle requests to set the "Active" characteristic
   setActive(value) {
     this.platform.log.debug('Triggered SET Active:', value);
-    // Check state to prevent duplicate requests
-    if (this.currState.on !== Boolean(value)) {
-      // Send to Dreo server via websocket
-      this.platform.webHelper.control(this.sn, {
-        [this.currState.powerCMD]: Boolean(value),
-      });
-    }
+    // Always send: the cached state is wrong exactly when the device ignored an earlier command.
+    // A duplicate write is merged into any other pending command by the queue.
+    this.platform.webHelper.control(this.sn, {
+      [this.currState.powerCMD]: Boolean(value),
+    });
   }
 
   // Handle requests to get the current value of the "Active" characteristic
