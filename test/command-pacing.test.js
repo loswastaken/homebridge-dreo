@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const util = require('node:util');
 const CommandQueue = require('../dist/CommandQueue').default;
-const { validateCommandQueueOptions } = require('../dist/CommandQueue');
+const { validateCommandQueueOptions, SPLIT_GROUPS } = require('../dist/CommandQueue');
 const DreoAPI = require('../dist/DreoAPI').default;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -61,12 +61,11 @@ test('a scene burst to one device is merged into one command', async (t) => {
   const { queue, sent } = makeQueue(t);
   queue.enqueue('SN1', { fanon: true });
   queue.enqueue('SN1', { fanon: true, windlevel: 4 });
-  queue.enqueue('SN1', { oscon: true });
 
   assert.ok(await waitFor(() => sent.length === 1));
   await sleep(INTERVAL + 50);
   assert.strictEqual(sent.length, 1);
-  assert.deepStrictEqual(sent[0].params, { fanon: true, windlevel: 4, oscon: true });
+  assert.deepStrictEqual(sent[0].params, { fanon: true, windlevel: 4 });
 });
 
 test('light and fan writes are sent separately, light first, spaced by the interval', async (t) => {
@@ -270,4 +269,126 @@ test('DreoAPI.control sends a paced control message over the websocket', async (
   assert.deepStrictEqual(message.params, { fanon: true });
   assert.strictEqual(typeof message.timestamp, 'number');
   assert.deepStrictEqual(Object.keys(message), ['deviceSn', 'method', 'params', 'timestamp']);
+});
+
+// Scene splitting: a merged main batch with more than two keys goes out as paced groups
+const gaps = (sent) => sent.slice(1).map((s, i) => s.at - sent[i].at);
+const params = (sent) => sent.map((s) => s.params);
+
+test('SPLIT_GROUPS is power, speed, then oscillation and lock', () => {
+  assert.deepStrictEqual(SPLIT_GROUPS, [['poweron', 'fanon'], ['mode', 'windlevel'], ['oscmode', 'oscon', 'childlockon']]);
+});
+
+test('a 5-key scene burst is split into three paced groups in order', async (t) => {
+  const { queue, sent } = makeQueue(t);
+  for (const p of [{ oscmode: 1 }, { poweron: true }, { childlockon: false }, { mode: 2 }, { windlevel: 5 }]) {
+    queue.enqueue('SN1', p);
+  }
+
+  assert.ok(await waitFor(() => sent.length === 3));
+  await sleep(INTERVAL + 50);
+  assert.deepStrictEqual(params(sent), [{ poweron: true }, { mode: 2, windlevel: 5 }, { oscmode: 1, childlockon: false }]);
+  for (const gap of gaps(sent)) {
+    assert.ok(gap >= INTERVAL - 1, `spacing ${gap}ms`);
+  }
+});
+
+test('a power-off burst sends power last', async (t) => {
+  const { queue, sent } = makeQueue(t);
+  queue.enqueue('SN1', { poweron: false, mode: 1, windlevel: 2, oscmode: 0 });
+
+  assert.ok(await waitFor(() => sent.length === 3));
+  await sleep(INTERVAL + 50);
+  assert.deepStrictEqual(params(sent), [{ mode: 1, windlevel: 2 }, { oscmode: 0 }, { poweron: false }]);
+});
+
+test('keys outside the known groups are sent last', async (t) => {
+  const { queue, sent } = makeQueue(t);
+  queue.enqueue('SN1', { poweron: true, windlevel: 3, oscmode: 1, foo: 1 });
+
+  assert.ok(await waitFor(() => sent.length === 4));
+  assert.deepStrictEqual(params(sent), [{ poweron: true }, { windlevel: 3 }, { oscmode: 1 }, { foo: 1 }]);
+});
+
+test('a two-key batch is sent as one command, not split', async (t) => {
+  const { queue, sent } = makeQueue(t);
+  queue.enqueue('SN1', { poweron: true, windlevel: 3 });
+
+  assert.ok(await waitFor(() => sent.length === 1));
+  await sleep(INTERVAL + 50);
+  assert.deepStrictEqual(params(sent), [{ poweron: true, windlevel: 3 }]);
+});
+
+test('a light write is unaffected by a split main burst', async (t) => {
+  const { queue, sent } = makeQueue(t);
+  queue.enqueue('SN1', { lighton: true, brightness: 50, colortemp: 30 });
+  for (const p of [{ oscmode: 1 }, { poweron: true }, { childlockon: false }, { mode: 2 }, { windlevel: 5 }]) {
+    queue.enqueue('SN1', p);
+  }
+
+  assert.ok(await waitFor(() => sent.length === 4));
+  await sleep(INTERVAL + 50);
+  assert.deepStrictEqual(params(sent), [
+    { lighton: true, brightness: 50, colortemp: 30 },
+    { poweron: true },
+    { mode: 2, windlevel: 5 },
+    { oscmode: 1, childlockon: false },
+  ]);
+});
+
+test('an unconfirmed 5-key scene resends each group once and warns once', async (t) => {
+  const { queue, sent, warns } = makeQueue(t, { commandConfirmTimeoutMs: CONFIRM });
+  const scene = { oscmode: 1, poweron: true, childlockon: false, mode: 2, windlevel: 5 };
+  for (const [key, value] of Object.entries(scene)) {
+    queue.enqueue('SN1', { [key]: value });
+  }
+  queue.handleMessage({ devicesn: 'SN1', method: 'control-reply', reported: scene });
+
+  assert.ok(await waitFor(() => warns.length >= 1, 6000));
+  await sleep(CONFIRM + INTERVAL + 100);
+  assert.strictEqual(sent.length, 6);
+  const groups = [{ poweron: true }, { mode: 2, windlevel: 5 }, { oscmode: 1, childlockon: false }];
+  assert.deepStrictEqual(params(sent), [...groups, ...groups]);
+  assert.ok(sent.every((s) => Object.keys(s.params).length <= 2));
+  assert.strictEqual(warns.length, 1);
+});
+
+test('a control-report confirms only the group it shares a key with', async (t) => {
+  const { queue, sent } = makeQueue(t, { commandConfirmTimeoutMs: CONFIRM });
+  for (const p of [{ oscmode: 1 }, { poweron: true }, { childlockon: false }, { mode: 2 }, { windlevel: 5 }]) {
+    queue.enqueue('SN1', p);
+  }
+  assert.ok(await waitFor(() => sent.length === 3));
+  queue.handleMessage({ devicesn: 'SN1', method: 'control-report', reported: { poweron: true } });
+
+  assert.ok(await waitFor(() => sent.length === 5));
+  await sleep(CONFIRM + INTERVAL + 100);
+  assert.deepStrictEqual(params(sent).slice(3), [{ mode: 2, windlevel: 5 }, { oscmode: 1, childlockon: false }]);
+  assert.strictEqual(sent.length, 5);
+});
+
+test('a windlevel write while the speed group is queued replaces its value', async (t) => {
+  const { queue, sent } = makeQueue(t, { commandIntervalMs: 400 });
+  queue.enqueue('SN1', { poweron: true, mode: 2, windlevel: 5 });
+  assert.ok(await waitFor(() => sent.length === 1));
+  queue.enqueue('SN1', { windlevel: 6 });
+
+  assert.ok(await waitFor(() => sent.length === 2));
+  await sleep(500);
+  assert.deepStrictEqual(params(sent), [{ poweron: true }, { mode: 2, windlevel: 6 }]);
+});
+
+test('stop() drops queued split groups and leaves no timers', async (t) => {
+  const { queue, sent } = makeQueue(t, { commandConfirmTimeoutMs: CONFIRM });
+  queue.enqueue('SN1', { poweron: true, mode: 2, windlevel: 5, oscmode: 1 });
+  assert.ok(await waitFor(() => sent.length === 1));
+  queue.stop();
+
+  for (const device of queue.devices.values()) {
+    assert.strictEqual(device.timer, undefined);
+    assert.deepStrictEqual(device.awaiting, []);
+    assert.deepStrictEqual(device.batches, []);
+  }
+  await sleep(CONFIRM + INTERVAL + 100);
+  assert.strictEqual(sent.length, 1);
 });

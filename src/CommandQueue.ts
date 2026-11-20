@@ -25,6 +25,20 @@ const WARN_INTERVAL = 10 * 60 * 1000;
 // Keys that control a fan's light. A device applies these separately from the fan itself.
 const LIGHT_KEYS = new Set(['lighton', 'brightness', 'colortemp']);
 
+// A main-part batch with more than this many keys is split into paced groups. The fan drops a large
+// combined command (for example a 5-key scene), but applies the same keys sent in smaller steps.
+const MAX_UNSPLIT_KEYS = 2;
+
+// Order in which the keys of a split batch are sent. Keys not listed here go last, as one group.
+export const SPLIT_GROUPS: readonly (readonly string[])[] = [
+  ['poweron', 'fanon'],
+  ['mode', 'windlevel'],
+  ['oscmode', 'oscon', 'childlockon'],
+];
+
+// The keys of the power group; a false value turns the fan off
+const POWER_KEYS = SPLIT_GROUPS[0];
+
 type Part = 'main' | 'light' | 'mixed';
 
 interface Batch {
@@ -104,6 +118,11 @@ export function validateCommandQueueOptions(config: Record<string, unknown> | un
  * which is exactly what a HomeKit scene produces. Writes to the same device are merged into one
  * command where possible, and the remaining commands are spaced out so each one is applied.
  * Devices never wait on each other.
+ *
+ * A merged scene with more than two fan keys is too much for the fan to apply at once, so it is split
+ * into ordered groups (see SPLIT_GROUPS) that are sent one per interval: power, then mode and speed,
+ * then oscillation and child lock, then anything else. Turning the fan off sends power last. The
+ * worst-case delay is about (groups - 1) x commandIntervalMs.
  */
 export default class CommandQueue {
   private readonly devices = new Map<string, DeviceQueue>();
@@ -237,15 +256,50 @@ export default class CommandQueue {
     }
 
     device.batches.shift();
+    const groups = this.split(batch);
+    let toSend = batch;
+    if (groups.length > 1) {
+      this.log.debug('Splitting command for %s into groups: %s', sn, groups.map((g) => `[${Object.keys(g).join(', ')}]`).join(' '));
+      // The rest wait at the front of the queue, held only by the interval pacing
+      const rest = groups.slice(1).map((params): Batch => ({params: params, part: 'main', createdAt: batch.createdAt, resend: false}));
+      device.batches.unshift(...rest);
+      toSend = {...batch, params: groups[0]};
+    }
     device.lastSentAt = now;
-    this.log.debug('Sending command to %s (keys: %s)', sn, Object.keys(batch.params).join(', '));
+    this.log.debug('Sending command to %s (keys: %s)', sn, Object.keys(toSend.params).join(', '));
     try {
-      this.send(sn, batch.params);
+      this.send(sn, toSend.params);
     } catch (error) {
       this.log.warn('Could not send command to Dreo device %s: %s', sn, (error as Error)?.message ?? error);
     }
-    this.awaitConfirmation(sn, device, batch);
+    this.awaitConfirmation(sn, device, toSend);
     this.schedule(sn, device);
+  }
+
+  // The ordered groups a batch is sent in; a single group means the batch is sent unchanged
+  private split(batch: Batch): Params[] {
+    const keys = Object.keys(batch.params);
+    // A resend is never split again
+    if (batch.resend || batch.part !== 'main' || keys.length <= MAX_UNSPLIT_KEYS) {
+      return [batch.params];
+    }
+    const listed = new Set<string>();
+    SPLIT_GROUPS.forEach((group) => group.forEach((key) => listed.add(key)));
+    const groups = [...SPLIT_GROUPS.map((group) => keys.filter((key) => group.includes(key))), keys.filter((key) => !listed.has(key))]
+      .filter((group) => group.length > 0)
+      .map((group) => {
+        const params: Params = {};
+        group.forEach((key) => params[key] = batch.params[key]);
+        return params;
+      });
+    if (groups.length < 2) {
+      return [batch.params];
+    }
+    // Turning the fan off goes last, so settings are not sent to a fan that was just turned off
+    if (POWER_KEYS.some((key) => key in groups[0]) && POWER_KEYS.some((key) => batch.params[key] === false)) {
+      groups.push(groups.shift() as Params);
+    }
+    return groups;
   }
 
   // Resend a batch once if the device doesn't report the change in time
